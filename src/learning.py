@@ -6,7 +6,7 @@ from numpy.random import RandomState
 from torch.utils.data import DataLoader
 from typing import Mapping, Optional
 
-from src.poisoning import poison_labels
+from src.endpoints import poison_labels
 
 
 def fedavg(
@@ -63,7 +63,8 @@ def local_fit(
 
     # Malicious node that flips labels for selected clients
     if attack is not None:
-        client_labels = data_loader.dataset.targets
+        # client_labels = data_loader.dataset.targets
+        client_labels = [y for (x, y) in data_loader.dataset]
         poisoned_labels = poison_labels(list(client_labels), attack)
         data_loader.dataset.targets = torch.tensor(poisoned_labels)
 
@@ -72,6 +73,8 @@ def local_fit(
         "module": module,
     }
     for key, value in trainer.callback_metrics.items():
+        if isinstance(value, torch.Tensor):
+            value = value.item()
         results[key] = value
 
     return results

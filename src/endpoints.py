@@ -1,6 +1,8 @@
+import numpy as np
+
 from collections import defaultdict
 from numpy.random import RandomState
-
+from torch.utils.data import Dataset, Subset, random_split
 from typing import Mapping, Optional
 
 
@@ -12,6 +14,23 @@ def poison_labels(labels, attack: Mapping[int, int]):
         else:
             new_labels.append(label)
     return new_labels
+
+
+def create_endpoints(
+        num: int,
+        dataset: Dataset,
+        random_state: Optional[RandomState] = None
+) -> dict[int, Subset]:
+    if random_state is None:
+        random_state = RandomState()
+
+    endpoints = list(range(num))
+    lengths = np.array([len(dataset) // num] * num)
+    splits = random_split(dataset, lengths)
+    return {
+        endp: split
+        for endp, split in zip(endpoints, splits)
+    }
 
 
 def create_malicious_endpoints(
