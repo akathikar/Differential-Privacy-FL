@@ -19,7 +19,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import lightning as L
 import numpy as np  
 
-PATH_DATASETS = os.environ.get("PATH_DATASETS", ".")
+PATH_DATASETS = os.environ.get("PATH_DATASETS", "")
 BATCH_SIZE = 256 if torch.cuda.is_available() else 64
 
 

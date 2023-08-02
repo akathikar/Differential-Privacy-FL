@@ -1,3 +1,4 @@
+# this code has clustering done! Now to add malicious nodes and m
 import argparse
 import copy
 import os
@@ -13,7 +14,7 @@ from numpy.random import RandomState
 from concurrent.futures import ThreadPoolExecutor
 from torchmetrics import Accuracy
 from torchvision import transforms
-from torchvision.datasets import MNIST
+from torchvision.datasets import CIFAR10
 from typing import Optional
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
@@ -21,8 +22,7 @@ import lightning as L
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 
-
-PATH_DATASETS = os.environ.get("PATH_DATASETS", ".")
+PATH_DATASETS = os.environ.get("PATH_DATASETS", "..")
 BATCH_SIZE = 256 if torch.cuda.is_available() else 64
 
 
@@ -34,14 +34,26 @@ class FederatedSampler(torch.utils.data.Sampler):
         pass
 
 
-class MnistModule(L.LightningModule):
+class CIFARModule(L.LightningModule):
     def __init__(self):
         super().__init__()
-        self.l1 = torch.nn.Linear(28 * 28, 10)
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.flatten = nn.Flatten()  # Add Flatten layer
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
         self.test_accuracy = Accuracy(task="multiclass", num_classes=10)
 
     def forward(self, x: torch.Tensor):
-        return torch.relu(self.l1(x.view(x.size(0), -1)))
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.flatten(x)  # Flatten the 4D tensor to 2D
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
     def training_step(self, batch, batch_nb):
         x, y = batch
@@ -71,6 +83,10 @@ def local_fit(endp_id: int, module: L.LightningModule, data_loader: DataLoader, 
     return endp_id, module
 
 
+def get_weights_as_tensor(module):
+    weight_tensors = [param for name, param in module.named_parameters() if 'weight' in name]
+    return torch.cat([w.view(-1) for w in weight_tensors])
+
 
 def fedavg(module: L.LightningModule, updates: dict[int, L.LightningModule],
            endpoints: dict[int, torch.utils.data.Sampler],
@@ -93,17 +109,28 @@ def fedavg(module: L.LightningModule, updates: dict[int, L.LightningModule],
             avg_weights[name] += noise_weights
     return avg_weights
 
+
+def calculate_cosine_similarity(weights1, weights2):
+    similarities = []
+    for name in weights1:
+        w1 = weights1[name].view(-1)
+        w2 = weights2[name].view(-1)
+        similarity = cosine_similarity(w1.detach().numpy().reshape(1, -1), w2.detach().numpy().reshape(1, -1))
+        similarities.append(similarity.item())
+    return np.mean(similarities)
+
+
 def main(args):
     random_state = RandomState(args.seed)
-    module = MnistModule()
+    module = CIFARModule()
     global_rounds = 10
-    mnist_train_data = MNIST(
+    mnist_train_data = CIFAR10(
         PATH_DATASETS,
         train=True,
         download=True,
         transform=transforms.ToTensor()
     )
-    mnist_test_data = MNIST(
+    mnist_test_data = CIFAR10(
         PATH_DATASETS,
         train=False,
         download=True,
@@ -117,11 +144,13 @@ def main(args):
         )
         for endp in range(args.endpoints)
     }
-    # Randomly select some of the endpoints for data flipping
-    flipped_endpoints = random.sample(list(endpoints.keys()), len(endpoints) // 10)
+    # Randomly select half of the endpoints for data flipping
+    flipped_endpoints = random.sample(list(endpoints.keys()), len(endpoints) // 1)
     accuracies = []  # Store accuracy after each global round
     pca_list = []  # Store PCA results after each global round
     kmeans_clusters_list = []  # Store k-means cluster labels for each global round and each local round
+    cosine_similarities = []  # Store cosine similarity after each global round
+
     for gr in range(global_rounds):
         print(f">> Starting global round ({gr + 1}/{global_rounds}).")
 
@@ -144,10 +173,14 @@ def main(args):
         updates = [fut.result() for fut in futures]
         updates = {endp: module for (endp, module) in updates}
         avg_weights = fedavg(module, updates, endpoints, args.noise)
-        pca = PCA(n_components=2)
-        all_local_pca_results = []  # Store all PCA results from all local rounds and global rounds
-        all_local_kmeans_clusters = []  # Store all k-means clusters from all local rounds and global rounds
 
+        # Calculate cosine similarity
+        original_weights = copy.deepcopy(module.state_dict())
+        module.load_state_dict(avg_weights)
+        noisy_weights = copy.deepcopy(module.state_dict())
+
+        cos_similarity = calculate_cosine_similarity(original_weights, noisy_weights)
+        cosine_similarities.append(cos_similarity)
 
         # Compute PCA for each endpoint's model weights
         endpoint_pca = PCA(n_components=2)
@@ -157,7 +190,7 @@ def main(args):
             local_weights = [copy.deepcopy(module.state_dict()) for _, module in updates.items()]
             local_flatten_weights = [torch.cat([param.flatten() for param in weights.values()]) for weights in
                                      local_weights]
-            endpoint_pca_result = pca.fit_transform(torch.stack(local_flatten_weights).numpy())
+            endpoint_pca_result = endpoint_pca.fit_transform(torch.stack(local_flatten_weights).numpy())
             local_pca_results.append(endpoint_pca_result)
 
             # Perform k-means clustering on PCA results with 2 clusters
@@ -165,39 +198,20 @@ def main(args):
             kmeans_clusters = kmeans.fit_predict(endpoint_pca_result)
             local_kmeans_clusters.append(kmeans_clusters)
 
-        all_local_pca_results.append(local_pca_results)
-        all_local_kmeans_clusters.append(local_kmeans_clusters)
-
-    # Flatten the list of all PCA results and all k-means clusters
-    all_local_pca_results = [item for sublist in all_local_pca_results for item in sublist]
-    all_local_kmeans_clusters = [item for sublist in all_local_kmeans_clusters for item in sublist]
-
-    # Plot PCA representations of the k-means clusters for every avg_weights
-    plt.figure(figsize=(12, 8))
-    num_avg_weights = len(all_local_pca_results) // global_rounds
-    for i in range(0, len(all_local_pca_results), num_avg_weights):
-        pca_results = all_local_pca_results[i:i + num_avg_weights]
-        kmeans_clusters = all_local_kmeans_clusters[i:i + num_avg_weights]
-
-        plt.subplot(2, 5, i // num_avg_weights + 1)  # 2 rows, 5 columns for each global round
-        for pca_result, kmeans_cluster in zip(pca_results, kmeans_clusters):
-            plt.scatter(pca_result[:, 0], pca_result[:, 1], c=kmeans_cluster)
-
-        plt.xlabel("Principal Component 1")
-        plt.ylabel("Principal Component 2")
-        plt.title(f"Global Round {i // num_avg_weights + 1}")
-    plt.tight_layout()
-    plt.show()
+        pca_list.append(local_pca_results)
+        kmeans_clusters_list.append(local_kmeans_clusters)
 
     # Plotting the accuracy using Seaborn
     x = list(range(1, global_rounds + 1))
     y = accuracies
 
+    # Train the model and get the weights
+
     # Perform PCA on the model weights with 2 components
     pca = PCA(n_components=2)
-    original_weights = pca_list
+    original_weights = get_weights_as_tensor(module)
     pca_result = pca.fit_transform(original_weights.view(-1, 2).detach().numpy())
-    kmeans_pca = KMeans(n_clusters=2, random_state=42, init = "k-means++")
+    kmeans_pca = KMeans(n_clusters=2, random_state=42)
     kmeans_clusters = kmeans_pca.fit_predict(original_weights.view(-1, 2).detach().numpy())
 
     # Plot PCA representations of the model weights

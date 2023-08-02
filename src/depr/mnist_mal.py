@@ -1,4 +1,3 @@
-
 import argparse
 import copy
 import os
@@ -14,17 +13,13 @@ from numpy.random import RandomState
 from concurrent.futures import ThreadPoolExecutor
 from torchmetrics import Accuracy
 from torchvision import transforms
-from torchvision.datasets import MNIST as CIFAR10
+from torchvision.datasets import MNIST
 from typing import Optional
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
 import lightning as L
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from pathlib import Path
+import numpy as np
 
-
-PATH_DATASETS = os.environ.get("PATH_DATASETS", ".")
+PATH_DATASETS = os.environ.get("PATH_DATASETS", "..")
 BATCH_SIZE = 256 if torch.cuda.is_available() else 64
 
 
@@ -36,7 +31,7 @@ class FederatedSampler(torch.utils.data.Sampler):
         pass
 
 
-class CIFARModule(L.LightningModule):
+class MnistModule(L.LightningModule):
     def __init__(self):
         super().__init__()
         self.l1 = torch.nn.Linear(28 * 28, 10)
@@ -64,23 +59,10 @@ class CIFARModule(L.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=0.02)
 
 
-def local_fit(endp_id: int, module: L.LightningModule, data_loader: DataLoader, flip_data: bool = False):
-    if flip_data:
-        # Perform data flipping
-        data_loader.dataset.data = 255 - data_loader.dataset.data
+def local_fit(endp_id: int, module: L.LightningModule, data_loader: DataLoader):
     trainer = L.Trainer(accelerator="auto", devices=1, max_epochs=3)
     trainer.fit(module, data_loader)
-     # Malicious node that flips labels for selected clients
-    if endp_id % 5 == 0:
-        client_labels = data_loader.dataset.targets
-        flipped_labels = [3 for label in client_labels]             
-        data_loader.dataset.targets = torch.tensor(flipped_labels)    
     return endp_id, module
-
-
-def get_weights_as_tensor(module):
-    weight_tensors = [param for name, param in module.named_parameters() if 'weight' in name]
-    return torch.cat([w.view(-1) for w in weight_tensors])
 
 
 def fedavg(module: L.LightningModule, updates: dict[int, L.LightningModule],
@@ -99,9 +81,9 @@ def fedavg(module: L.LightningModule, updates: dict[int, L.LightningModule],
                 avg_weights[name] += coef * param.detach()
             else:
                 avg_weights[name] = coef * param.detach()
-        if noise > 0.00:
-            noise_weight = np.random.normal(0,1,100)
-            avg_weights += noise_weight
+        for name, param in avg_weights.items():
+            noise_weights = torch.randn_like(param) ** noise
+            avg_weights[name] += noise_weights
     return avg_weights
 
 
@@ -117,15 +99,15 @@ def calculate_cosine_similarity(weights1, weights2):
 
 def main(args):
     random_state = RandomState(args.seed)
-    module = CIFARModule()
+    module = MnistModule()
     global_rounds = 10
-    cifar_train_data = CIFAR10(
+    mnist_train_data = MNIST(
         PATH_DATASETS,
         train=True,
         download=True,
         transform=transforms.ToTensor()
     )
-    cifar_test_data = CIFAR10(
+    mnist_test_data = MNIST(
         PATH_DATASETS,
         train=False,
         download=True,
@@ -133,43 +115,46 @@ def main(args):
     )
     endpoints = {
         endp: torch.utils.data.RandomSampler(
-            cifar_train_data,
+            mnist_train_data,
             replacement=False,
             num_samples=random_state.randint(10, 250)
         )
         for endp in range(args.endpoints)
     }
-    # Randomly select half of the endpoints for data flipping
-    flipped_endpoints = random.sample(list(endpoints.keys()), len(endpoints) // 2)
+
+    # Add malicious nodes with data flipping
+    malicious_fraction = .2  # Fraction of endpoints to be malicious
+    num_malicious_endpoints = max(0, int(malicious_fraction * args.endpoints))
+    malicious_endpoints = random_state.choice(list(endpoints), size=num_malicious_endpoints, replace=False)
+
+    for endp in malicious_endpoints:
+        endpoints[endp] = torch.utils.data.SequentialSampler(malicious_data)
+
     accuracies = []  # Store accuracy after each global round
-    pca_list = []  # Store PCA results after each global round and each local round
-    kmeans_clusters_list = []  # Store k-means cluster labels for each global round and each local round
     cosine_similarities = []  # Store cosine similarity after each global round
 
     for gr in range(global_rounds):
         print(f">> Starting global round ({gr + 1}/{global_rounds}).")
 
-        size = max(1, int(args.participation_frac * len(endpoints)))
+        size = max(10, int(args.participation_frac * len(endpoints)))
         selected_endps = random_state.choice(list(endpoints), size=size, replace=False)
         futures = []
         with ThreadPoolExecutor(max_workers=size) as exc:
             for endp in selected_endps:
-                is_malicious = endp in flipped_endpoints
                 fut = exc.submit(
                     local_fit,
                     endp,
                     copy.deepcopy(module),
-                    DataLoader(cifar_train_data, sampler=endpoints[endp], batch_size=args.batch_size),
-                    is_malicious  # Pass flip_data flag
+                    DataLoader(mnist_train_data, sampler=endpoints[endp], batch_size=args.batch_size)
                 )
                 print("Job submitted!")
                 futures.append(fut)
 
-        updates = {endp_id: module for (endp_id, module) in (fut.result() for fut in futures)}
-
+        updates = [fut.result() for fut in futures]
+        updates = {endp: module for (endp, module) in updates}
         avg_weights = fedavg(module, updates, endpoints, args.noise)
 
-        # Calculate cosine similarity
+        # calculate cosine similarity
         original_weights = copy.deepcopy(module.state_dict())
         module.load_state_dict(avg_weights)
         noisy_weights = copy.deepcopy(module.state_dict())
@@ -177,47 +162,24 @@ def main(args):
         cos_similarity = calculate_cosine_similarity(original_weights, noisy_weights)
         cosine_similarities.append(cos_similarity)
 
-        print("THIS IS WEIGHTS")
-        wow = module.state_dict()
-        print (module.state_dict().keys())
-        
-        plt.xlabel("Principal Component 1")
-        plt.ylabel("Principal Component 2")
-        plt.title(f"PCA Representations of Model Weights for Each Endpoint (Global Round {gr + 1})")
-        plt.legend()
-        plt.savefig(Path(f'out/plots/pca_normal_20mal_with_endpoints_gr{gr + 1}.pdf'))
-        
+        trainer = L.Trainer()
+        metrics = trainer.test(module, DataLoader(mnist_test_data))
+        print(metrics)
+        accuracy = metrics[0]["test_acc"]
+        accuracies.append(accuracy)
+        print(accuracy)
 
     # Plotting the accuracy using Seaborn
     x = list(range(1, global_rounds + 1))
     y = accuracies
 
-    # Train the model and get the weights
-
-    # Perform PCA on the model weights with 2 components
-    pca = PCA(n_components=2)
-    original_weights = get_weights_as_tensor(module)
-    pca_result = pca.fit_transform(original_weights.view(-1, 2).detach().numpy())
-    kmeans_pca = KMeans(n_clusters=2, random_state=42)
-    kmeans_clusters = kmeans_pca.fit_predict(original_weights.view(-1, 2).detach().numpy())
-
-    # Plot PCA representations of the model weights
     plt.figure(figsize=(8, 6))
-    plt.scatter(pca_result[:, 0], pca_result[:, 1])
-    plt.xlabel("Principal Component 1")
-    plt.ylabel("Principal Component 2")
-    plt.title("PCA Representations of Model Weights")
-    plt.savefig('pca_normal_20mal.pdf')
+    sns.set(style="whitegrid")
+    sns.lineplot(x=x, y=y)
+    plt.xlabel("Global Rounds")
+    plt.ylabel("Accuracy")
+    plt.title(f"Accuracy with {int(malicious_fraction * 100)}% malicious nodes (data flipping)")
     plt.show()
-
-    # Plot PCA representations of the k-means clusters
-    plt.figure(figsize=(8, 6))
-    plt.scatter(pca_result[:, 0], pca_result[:, 1], c=kmeans_clusters)
-    plt.xlabel("Principal Component 1")
-    plt.ylabel("Principal Component 2")
-    plt.title("K-means Clustering of Model Weights (2 Clusters)")
-    plt.show()
-
 
 
 if __name__ == "__main__":
@@ -228,4 +190,9 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--batch_size", default=BATCH_SIZE, type=int)
     parser.add_argument("-n", '--noise', default=.00, type=float)
     main(parser.parse_args())
-                                                                                 
+
+for i in range(args.endpoints):
+    if i % 2 == 0:
+        client_labels = trainset.targets[i * 5000: (i + 1) * 5000]
+        flipped_labels = [(label + 1) % 10 for label in client_labels]
+        trainset.targets[i * 5000: (i + 1) * 5000] = flipped_labels

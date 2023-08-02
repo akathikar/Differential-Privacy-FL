@@ -24,7 +24,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 Helpful thread for a environmental issue with OpenMP:
 https://github.com/pytorch/pytorch/issues/44282
 """
-PATH_DATASETS = os.environ.get("PATH_DATASETS", ".")
+PATH_DATASETS = os.environ.get("PATH_DATASETS", "")
 BATCH_SIZE = 256 if torch.cuda.is_available() else 64
 
 
