@@ -78,6 +78,46 @@ class MNISTModule(L.LightningModule):
 
 ################################################################################
 
+class SimpleCIFARModule(L.LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),  # output: 64 x 16 x 16
+
+            nn.Flatten(),
+            nn.Linear(64 * 16 * 16, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 10),
+        )
+
+    def forward(self, x: torch.Tensor):
+        return self.network(x)
+
+    def training_step(self, batch, batch_nb):
+        x, y = batch
+        loss = F.cross_entropy(self(x), y)
+        self.log("train_loss", loss)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = F.nll_loss(logits, y)
+        preds = torch.argmax(logits, dim=1)
+        self.test_accuracy.update(preds, y)
+
+        self.log("test_loss", loss, prog_bar=True)
+        self.log("test_acc", self.test_accuracy, prog_bar=True)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=0.02)
+
 
 class CIFARModule(L.LightningModule):
     def __init__(self):

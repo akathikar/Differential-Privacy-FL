@@ -1,200 +1,58 @@
-import copy
+import argparse
 import os
-import random
-
-import pandas as pd
-import torch
-
-from argparse import ArgumentParser, Namespace
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from matplotlib import pyplot as plt
-from numpy.random import RandomState
+from datetime import datetime
 from pathlib import Path
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA, KernelPCA, SparsePCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC, OneClassSVM
-from torch.utils.data import DataLoader, Subset
-from torchvision import transforms
-from torchvision.datasets import MNIST, CIFAR10
+from typing import Any, Optional
 
-from src.learning import local_fit, fedavg
-from src.modules import SimpleMNISTModule, CIFARModule, MNISTModule
-from src.endpoints import create_malicious_endpoints, create_endpoints
-from src.utils import calculate_cosine_similarity, get_weights_as_list, flatten_module_params
+from numpy.random import RandomState
 
-PATH_DATASETS = os.environ["TORCH_DATASETS"]
-BATCH_SIZE = 32  # if torch.cuda.is_available() else 64
+from src.modules import SimpleCIFARModule
+from src.runner import run_experiment
 
 
-def load_data(name: str):
-    match name:
-        case "mnist":
-            train_data = MNIST(
-                PATH_DATASETS,
-                train=True,
-                download=False,
-                transform=transforms.ToTensor()
-            )
-            test_data = MNIST(
-                PATH_DATASETS,
-                train=False,
-                download=False,
-                transform=transforms.ToTensor(),
-            )
-        case "cifar10":
-            train_data = CIFAR10(
-                PATH_DATASETS,
-                train=True,
-                download=False,
-                transform=transforms.ToTensor()
-            )
-            test_data = CIFAR10(
-                PATH_DATASETS,
-                train=False,
-                download=False,
-                transform=transforms.ToTensor(),
-            )
-        case _:
-            raise ValueError("Illegal data name.")
-    return train_data, test_data
-
-
-def get_args() -> Namespace:
-    parser = ArgumentParser()
-    parser.add_argument("-d", "--data", default="mnist", type=str)
-    parser.add_argument("-s", "--seed", default=123, type=int)
-    parser.add_argument("-e", "--endpoints", default=20, type=int)
-    parser.add_argument("-m", "--num_malicious", default=2, type=int)
-    parser.add_argument("-f", "--num_flipped", default=3, type=int)
-    parser.add_argument("-c", "--participation_frac", default=1.0, type=float)
-    parser.add_argument("-b", "--batch_size", default=BATCH_SIZE, type=int)
-    parser.add_argument("-n", '--noise', default=None, type=float)
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--processes", type=int, default=1)
+    parser.add_argument("-s", "--seed", type=int, default=1234)
     return parser.parse_args()
 
 
-def main(args):
-    random_state = RandomState(args.seed)
-    global_module = MNISTModule()
-    global_rounds = 2
+def main(
+        param_suite: dict[str, list[Any]],
+        processes: int = 1,
+        seed: Optional[int] = None
+):
+    # Run the experiment with a comprehensive suite of parameters.
+    timestamp = datetime.now().strftime("%Y-%m-%d %I.%M %p")
+    random_state = RandomState(seed)
+    data = run_experiment(timestamp, param_suite, processes, random_state)
 
-    train_data, test_data = load_data(args.data)
-    # train_size = 5_000
-    # if train_size:
-    #     indices = list(random_state.choice(list(range(len(train_data))), size=train_size))
-    #     train_data = Subset(train_data, indices)
-    endpoints = create_endpoints(args.endpoints, train_data, random_state)
-
-    # Randomly select half of the endpoints for data flipping
-    # malicious_endpoints = random.sample(list(endpoints.keys()), args.num_malicious)
-    data_labels = list(train_data.class_to_idx.values())
-    mal_endpoints = create_malicious_endpoints(
-        list(endpoints),
-        data_labels,
-        args.num_malicious,
-        args.num_flipped,
-        random_state
-    )
-    accuracies = []  # Store accuracy after each global round
-    pca_list = []  # Store PCA results after each global round and each local round
-    kmeans_clusters_list = []  # Store k-means cluster labels for each global round and each local round
-    cosine_similarities = []  # Store cosine similarity after each global round
-
-    experiment_results = defaultdict(list)
-    local_module_history = {endp: copy.deepcopy(global_module) for endp in endpoints}
-
-    for gr in range(global_rounds):
-        print(f">> Starting global round ({gr + 1}/{global_rounds}).")
-        size = max(1, int(args.participation_frac * len(endpoints)))
-        selected_endps = random_state.choice(list(endpoints), size=size, replace=False)
-        futures = []
-
-        # Launch the local training jobs to the endpoints.
-        with ThreadPoolExecutor(max_workers=size) as exc:
-            for endp in selected_endps:
-                attack = mal_endpoints.get(endp, None)
-                endp_data = endpoints[endp]
-                dataloader = DataLoader(endp_data, batch_size=args.batch_size)
-                fut = exc.submit(
-                    local_fit,
-                    endp,
-                    local_module_history[endp],
-                    # copy.deepcopy(global_module),
-                    dataloader,
-                    args.noise,
-                    attack,
-                    random_state
-                )
-                futures.append(fut)
-
-        # Collect the module updates from the job futures.
-        results = [fut.result() for fut in futures]
-        local_modules = {res["endpoint_id"]: res["module"] for res in results}
-        train_losses = {res["endpoint_id"]: res["train_loss"] for res in results}
-
-        do_averaging = True
-        if do_averaging:
-            avg_weights = fedavg(global_module, local_modules, endpoints)
-            global_module.load_state_dict(avg_weights)
-            for endp in endpoints:
-                local_module_history[endp] = copy.deepcopy(global_module)
-        else:
-            for endp in endpoints:
-                local_module_history[endp] = copy.deepcopy(local_modules[endp])
-
-        # Perform the PCA analysis for this global round.
-        ordered_endpoint_ids, ordered_local_modules = [], []
-        for endp, module in local_modules.items():
-            ordered_endpoint_ids.append(endp)
-            ordered_local_modules.append(module)
-
-        # Parameters of last module layers
-        # pca_in = [
-        #     get_weights_as_list(module)[-1]
-        #     for module in ordered_local_modules
-        # ]
-
-        # Parameters of the entire model flattened into a single 1D array
-        pca_in = [
-            flatten_module_params(module)
-            for module in ordered_local_modules
-        ]
-        
-        pca_in = StandardScaler().fit_transform(pca_in)
-
-        for pca_model in [KernelPCA, PCA, SparsePCA]:
-            if pca_model is KernelPCA:
-                gr_pca = pca_model(n_components=2, kernel="rbf")
-            else:
-                gr_pca = pca_model(n_components=2)
-
-            pca_out = gr_pca.fit_transform(pca_in)
-
-            std_pca_out = StandardScaler().fit_transform(pca_out)
-            clf = OneClassSVM()
-            clf.fit(std_pca_out)
-            pred = clf.predict(std_pca_out)
-
-            for (endp, pca_x, pca_y, pred_label) in zip(ordered_endpoint_ids, pca_out[:, 0], pca_out[:, 1], pred):
-                experiment_results["global_round"].append(gr)
-                experiment_results["endpoint"].append(endp)
-                experiment_results["train_loss"].append(train_losses[endp])
-                experiment_results["pca_kind"].append(pca_model.__name__)
-                experiment_results["pca_x"].append(pca_x)
-                experiment_results["pca_y"].append(pca_y)
-                experiment_results["is_malicious"].append(endp in mal_endpoints)
-                experiment_results["pred"].append(pred_label)
-
-    experiment_df = pd.DataFrame.from_dict(experiment_results)
-    experiment_df.to_csv(Path("out/data/pca-test.csv"))
+    # Save the data.
+    out_filename = f"{timestamp}.csv"
+    out_dir = Path("out/data/final-results")
+    if not out_dir.exists():
+        os.makedirs(out_dir)
+    data.to_csv(out_dir / out_filename)
 
 
 if __name__ == "__main__":
-    import warnings
-    from lightning_utilities.core.rank_zero import log as device_logger
+    # Run the experiments using the below parameter suite.
+    suite = {
+        # Required params.
+        "module_cls": [SimpleCIFARModule],
+        "dataset_name": ["cifar10"],
+        "num_global_rounds": [1],  # [20],
+        "num_endpoints": [2],  # [10, 20, 30, 40, 50],
+        "frac_malicious_endpoints": [0],  # [0.0, 0.1, 0.2, 0.3],
+        "frac_flipped_label_pairs": [0.1],
+        "noise_scale": [None, 0.1],  # , 1., 10.],
 
-    device_logger.disabled = True
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-    main(get_args())
+        # Optional params.
+        "use_full_dataset": [False],
+        "dataset_max_len": [1_000],
+        "use_delta": [False],
+        "batch_size": [32],
+        "participation_frac": [1.0],
+    }
+    args = get_args()
+    main(suite, processes=args.processes, seed=args.seed)
