@@ -40,18 +40,19 @@ if __name__ == "__main__":
     suite = {
         # Required params.
         "module_cls": [SimpleCIFARModule],
+        "monte_carlo": [1],
         "dataset_name": ["cifar10"],
-        "num_global_rounds": [1],  # [20],
-        "num_endpoints": [2],  # [10, 20, 30, 40, 50],
-        "frac_malicious_endpoints": [0],  # [0.0, 0.1, 0.2, 0.3],
-        "frac_flipped_label_pairs": [0.1],
-        "noise_scale": [None, 0.1],  # , 1., 10.],
+        "num_global_rounds": [10],
+        "num_endpoints": [20],
+        "frac_malicious_endpoints": [0.10, 0.25, 0.5],  # [0.0, 0.1, 0.2, 0.3],
+        "frac_flipped_label_pairs": [0.1, 0.3, 0.5],
+        "noise_scale": [0.1, 1., 5., 10.],  # , 10.],
 
         # Optional params.
         "use_full_dataset": [False],
-        "dataset_max_len": [1_000],
+        "dataset_max_len": [10_000],
         "use_delta": [False],
-        "batch_size": [32],
+        "batch_size": [64],
         "participation_frac": [1.0],
     }
     args = get_args()

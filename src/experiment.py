@@ -9,7 +9,6 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from src.endpoints import create_endpoints, create_malicious_endpoints
 from src.learning import local_fit, fedavg, load_data
@@ -28,6 +27,7 @@ def run_trial(
         frac_malicious_endpoints: int,
         frac_flipped_label_pairs: int,
         noise_scale: Optional[float],
+        monte_carlo: int = 1,
         use_full_dataset: bool = False,
         dataset_max_len: int = 10_000,
         use_delta: bool = False,
@@ -72,9 +72,23 @@ def run_trial(
         num_flipped_label_pairs,
         random_state
     )
-    trial_results = defaultdict(list)
 
-    for gr in tqdm(range(num_global_rounds), desc=f"trial={trial_num + 1}/{total_trials}"):
+    trial_results = defaultdict(list)
+    for run in range(monte_carlo):
+        monte_carlo_run(
+            batch_size, endpoints, global_module, mal_endpoints, noise_scale,
+            num_global_rounds, participation_frac, random_state, trial_results,
+            use_delta
+        )
+
+    df = pd.DataFrame.from_dict(trial_results)
+    trial_info = TrialInfo(trial_num, total_trials)
+    return df, trial_info
+
+
+def monte_carlo_run(batch_size, endpoints, global_module, mal_endpoints, noise_scale, num_global_rounds,
+                    participation_frac, random_state, trial_results, use_delta):
+    for gr in range(num_global_rounds):
         size = max(1, int(participation_frac * len(endpoints)))
         selected_endps = random_state.choice(list(endpoints), size=size, replace=False)
         # futures = []
@@ -127,6 +141,7 @@ def run_trial(
             trial_results["component_2"].append(pca_y)
             trial_results["is_malicious"].append(endp in mal_endpoints)
             trial_results["kmeans_pred"].append(pred_label)
+            trial_results["noise_scale"].append(noise_scale)
 
         if mal_endpoints:
             malicious_dist = avg_distance([
@@ -136,7 +151,3 @@ def run_trial(
             ])
             trial_results["avg_malicious_distance"].extend(
                 [malicious_dist] * len(ordered_endpoint_ids))
-
-    df = pd.DataFrame.from_dict(trial_results)
-    trial_info = TrialInfo(trial_num, total_trials)
-    return df, trial_info

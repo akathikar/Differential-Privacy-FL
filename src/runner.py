@@ -38,6 +38,7 @@ def _single_process_run(
 ) -> pd.DataFrame:
     dataframes = []
     total_trials = len(param_suite)
+    pbar = tqdm(total=total_trials, desc=f"{1}/{total_trials}")
     for trial_num, params in enumerate(param_suite):
         df, _ = run_trial(
             trial_num=trial_num,
@@ -48,6 +49,9 @@ def _single_process_run(
         dataframes.append(df)
         data = pd.concat(dataframes).reset_index()
         checkpoint(data, timestamp, total_trials, trial_num)
+
+        pbar.update()
+        pbar.set_description(f"{trial_num + 1}/{total_trials}")
 
     return pd.concat(dataframes).reset_index()
 
@@ -84,6 +88,7 @@ def _multi_process_run(
 
     dataframes = []
     pbar = tqdm(total=len(jobs))
+    pbar_counter = 1
 
     with multiprocessing.Pool(processes=n_processes) as p:
         for res in p.imap_unordered(do_job, jobs):
@@ -91,6 +96,10 @@ def _multi_process_run(
             trial_num, total_trials = trial_info
             dataframes.append(data)
             checkpoint(data, timestamp, total_trials, trial_num)
+
+            pbar_counter += 1
+            pbar.set_description(f"{pbar_counter}/{total_trials}")
+            pbar.update()
 
     pbar.close()
     return pd.concat(dataframes).reset_index()
