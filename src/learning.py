@@ -1,12 +1,14 @@
-import lightning as L
-import numpy as np
-import torch
-from numpy.random import RandomState
-
-from torch.utils.data import DataLoader
 from typing import Mapping, Optional
 
-from src.poisoning import poison_labels
+import lightning as L
+import torch
+from numpy.random import RandomState
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import MNIST, CIFAR10
+
+from src.const import PATH_DATASETS
+from src.endpoints import poison_labels
 
 
 def fedavg(
@@ -63,7 +65,8 @@ def local_fit(
 
     # Malicious node that flips labels for selected clients
     if attack is not None:
-        client_labels = data_loader.dataset.targets
+        # client_labels = data_loader.dataset.targets
+        client_labels = [y for (x, y) in data_loader.dataset]
         poisoned_labels = poison_labels(list(client_labels), attack)
         data_loader.dataset.targets = torch.tensor(poisoned_labels)
 
@@ -72,6 +75,40 @@ def local_fit(
         "module": module,
     }
     for key, value in trainer.callback_metrics.items():
+        if isinstance(value, torch.Tensor):
+            value = value.item()
         results[key] = value
 
     return results
+
+
+def load_data(name: str):
+    if name == "mnist":
+        train_data = MNIST(
+            PATH_DATASETS,
+            train=True,
+            download=False,
+            transform=transforms.ToTensor()
+        )
+        test_data = MNIST(
+            PATH_DATASETS,
+            train=False,
+            download=False,
+            transform=transforms.ToTensor(),
+        )
+    elif name == "cifar10":
+        train_data = CIFAR10(
+            PATH_DATASETS,
+            train=True,
+            download=False,
+            transform=transforms.ToTensor()
+        )
+        test_data = CIFAR10(
+            PATH_DATASETS,
+            train=False,
+            download=False,
+            transform=transforms.ToTensor(),
+        )
+    else:
+        raise ValueError("Illegal data name.")
+    return train_data, test_data
