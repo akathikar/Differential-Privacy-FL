@@ -45,6 +45,13 @@ def local_fit(
     if random_state is None:
         random_state = RandomState()
 
+    # Malicious node that flips labels for selected clients
+    if attack is not None:
+        # client_labels = data_loader.dataset.targets
+        client_labels = [y for (x, y) in data_loader.dataset]
+        poisoned_labels = poison_labels(list(client_labels), attack)
+        data_loader.dataset.targets = torch.tensor(poisoned_labels)
+        
     trainer = L.Trainer(
         accelerator="auto",
         devices=1,
@@ -62,13 +69,6 @@ def local_fit(
         for name, param in module.named_parameters():
             state_dict[name] = param.detach() + random_state.normal(loc=0, scale=noise_scale)
         module.load_state_dict(state_dict)
-
-    # Malicious node that flips labels for selected clients
-    if attack is not None:
-        # client_labels = data_loader.dataset.targets
-        client_labels = [y for (x, y) in data_loader.dataset]
-        poisoned_labels = poison_labels(list(client_labels), attack)
-        data_loader.dataset.targets = torch.tensor(poisoned_labels)
 
     results = {
         "endpoint_id": endp_id,
